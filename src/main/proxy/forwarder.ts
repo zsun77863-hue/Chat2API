@@ -573,12 +573,22 @@ CRITICAL RULES:
     startTime: number
   ): Promise<ForwardResult> {
     try {
-      const transformed = this.transformRequestForPromptToolUse(request, provider)
+      // Always force prompt injection for DeepSeek web API
+      // DeepSeek web API does NOT support native tools parameter -
+      // tools must be injected into the system prompt as text
+      const injectionResult = promptInjectionService.process(
+        request.messages,
+        request.tools || [],
+        request.model,
+        provider?.id
+      )
       const transformedRequest = {
         ...request,
-        messages: transformed.messages,
-        tools: transformed.tools,
+        messages: injectionResult.messages,
+        tools: undefined, // DeepSeek web API doesn't support tools parameter
       }
+
+      console.log(`[DeepSeek] Tool injection: injected=${injectionResult.injected}, reason=${injectionResult.reason}, tools=${request.tools?.length || 0}`)
 
       const adapter = new DeepSeekAdapter(provider, account)
       
@@ -649,7 +659,10 @@ CRITICAL RULES:
       // Non-streaming requests need to collect stream data and convert
       const result = await handler.handleNonStream(response.data)
       
-      this.applyToolCallsToResponse(result, request.model, request.tools)
+      // Note: applyToolCallsToResponse is not needed for DeepSeek because
+      // handleNonStream already parses tool calls from text via parseToolCallsFromText.
+      // The tools are always in prompt format for DeepSeek web API.
+      this.applyToolCallsToResponse(result, request.model, transformedRequest.tools)
       
       if (deleteSessionCallback) {
         await deleteSessionCallback()
