@@ -147,7 +147,8 @@
       "icon": "build/icon.png",
       "artifactName": "${productName}-${version}-mac-${arch}.${ext}",
       "hardenedRuntime": true,
-      "gatekeeperAssess": false
+      "gatekeeperAssess": false,
+      "identity": false
     },
     "dmg": {
       "contents": [
@@ -239,8 +240,9 @@
     },
     "publish": {
       "provider": "github",
-      "owner": "xiaoY233",
+      "owner": "zsun77863-hue",
       "repo": "Chat2API"
-    }
+    },
+    "afterSign": null
   }
 }
