@@ -202,7 +202,16 @@ export class PromptInjectionService {
       return { shouldInject: true, reason: 'mode_always' }
     }
 
-    // Mode: auto - detect client
+    // Tools provided via API (OpenAI tools parameter) - always inject
+    // These tools are defined as API parameters, not as message content prompts.
+    // The model needs them injected into the system prompt to know about available tools.
+    // This is critical for Anthropic → OpenAI proxy scenarios where tools come from
+    // the Anthropic request's tools parameter.
+    if (detection.toolSource === 'openai') {
+      return { shouldInject: true, reason: 'api_tools' }
+    }
+
+    // Mode: auto - detect client (for MCP tools in message content)
     if (config.mode === 'auto') {
       // Known client - skip injection (client already injected)
       if (detection.isKnownClient) {
