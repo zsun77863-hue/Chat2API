@@ -240,7 +240,7 @@
     },
     "publish": {
       "provider": "github",
-      "owner": "xiaoY233",
+      "owner": "zsun77863-hue",
       "repo": "Chat2API"
     }
   }
