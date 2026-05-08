@@ -29,7 +29,7 @@
 import { ChatCompletionRequest, ChatMessage, ForwardResult } from './types'
 import type { Account, Provider } from '../store/types'
 import type { ProxyContext } from './types'
-import { requestForwarder } from '../forwarder'
+import { requestForwarder } from './forwarder'
 
 // ============================================================
 // Types
