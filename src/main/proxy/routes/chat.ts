@@ -1,6 +1,11 @@
 /**
  * Proxy Service Module - Chat Completions Route
  * Implements /v1/chat/completions route
+ * 
+ * Supports Agent Loop mode via X-Agent-Loop header:
+ * - When enabled, automatically handles multi-turn tool-calling sessions
+ * - Caches conversation state by session ID
+ * - Returns X-Session-Id header for the client to track
  */
 
 import Router from '@koa/router'
@@ -13,6 +18,7 @@ import { streamHandler } from '../stream'
 import { proxyStatusManager } from '../status'
 import { modelMapper } from '../modelMapper'
 import { storeManager } from '../../store/store'
+import { agentLoopManager } from '../agentLoop'
 import { 
   isAnthropicToolFormat,
   transformResponseToAnthropic,
@@ -138,6 +144,131 @@ router.post('/completions', async (ctx: Context) => {
     request.deep_research = true
     console.log('[Chat] Deep research enabled via X-Deep-Research header')
   }
+
+  // Check if Agent Loop is enabled via header or request body
+  const agentLoopEnabled = ctx.headers['x-agent-loop'] === 'true' || 
+                           (request as any).agent_loop === true
+  const existingSessionId = ctx.headers['x-session-id'] as string | undefined
+
+  if (agentLoopEnabled) {
+    // ===== AGENT LOOP PATH =====
+    // Handles multi-turn tool-calling automatically with session caching
+    try {
+      const config = storeManager.getConfig()
+      const preferredProviderId = modelMapper.getPreferredProvider(request.model)
+      const preferredAccountId = modelMapper.getPreferredAccount(request.model)
+
+      const selection = loadBalancer.selectAccount(
+        request.model,
+        config.loadBalanceStrategy,
+        preferredProviderId,
+        preferredAccountId
+      )
+
+      if (!selection) {
+        ctx.status = 503
+        ctx.body = {
+          error: {
+            message: `No available account for model: ${request.model}`,
+            type: 'service_unavailable_error',
+            param: null,
+            code: 'no_available_account',
+          },
+        }
+        return
+      }
+
+      const { account, provider, actualModel } = selection
+
+      const agentContext: ProxyContext = {
+        requestId,
+        providerId: provider.id,
+        accountId: account.id,
+        model: request.model,
+        actualModel,
+        startTime,
+        isStream: false, // Agent loop always uses non-stream
+        clientIP,
+      }
+
+      proxyStatusManager.recordRequestStart(request.model, provider.id, account.id)
+
+      const { result: agentResult, sessionId } = await agentLoopManager.handleRequest(
+        request,
+        account,
+        provider,
+        actualModel,
+        agentContext,
+        existingSessionId
+      )
+
+      const latency = Date.now() - startTime
+
+      if (!agentResult.success) {
+        proxyStatusManager.recordRequestFailure(latency)
+        ctx.status = agentResult.status || 500
+        ctx.body = {
+          error: {
+            message: agentResult.error || 'Request failed',
+            type: 'api_error',
+            param: null,
+            code: null,
+          },
+        }
+        return
+      }
+
+      proxyStatusManager.recordRequestSuccess(latency)
+
+      // Return response with session tracking headers
+      ctx.set('Content-Type', 'application/json')
+      if (sessionId) {
+        ctx.set('X-Session-Id', sessionId)
+      }
+
+      const agentSession = sessionId ? agentLoopManager.getSession(sessionId) : undefined
+      if (agentSession) {
+        ctx.set('X-Agent-Round', String(agentSession.roundNumber))
+        ctx.set('X-Agent-Completed', String(agentSession.completed))
+      }
+
+      if (agentResult.body) {
+        ctx.body = agentResult.body
+      } else {
+        ctx.body = {
+          id: requestId,
+          object: 'chat.completion',
+          created: Math.floor(Date.now() / 1000),
+          model: actualModel,
+          choices: [{
+            index: 0,
+            message: { role: 'assistant', content: '' },
+            finish_reason: 'stop',
+          }],
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        }
+      }
+
+      storeManager.recordRequestInStats(true, latency, request.model, provider.id, account.id)
+      return
+    } catch (error) {
+      const latency = Date.now() - startTime
+      proxyStatusManager.recordRequestFailure(latency)
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error'
+      ctx.status = 500
+      ctx.body = {
+        error: {
+          message: errorMessage,
+          type: 'internal_error',
+          param: null,
+          code: null,
+        },
+      }
+      return
+    }
+  }
+
+  // ===== NORMAL PATH (existing logic, unchanged) =====
 
   const config = storeManager.getConfig()
   const preferredProviderId = modelMapper.getPreferredProvider(request.model)
