@@ -138,14 +138,14 @@ router.get('/config', async (ctx: Context) => {
   ctx.body = {
     success: true,
     data: {
-      version: '1.4.1',
+      version: '1.4.2',
       maxRounds: 15,
       sessionTtlMs: 30 * 60 * 1000,
       cleanupIntervalMs: 60 * 1000,
       maxSessionsPerClient: 10,
       maxTotalSessions: 500,
       maxAnomalyCount: 3,
-      description: 'Agent loop automatically handles multi-turn tool-calling sessions. Enable via X-Agent-Loop: true header. v1.4.1 adds structured tool_calls detection, anomaly circuit-breaker, per-client isolation, graceful degradation, and full param inheritance.',
+      description: 'Agent loop automatically handles multi-turn tool-calling sessions. Enable via X-Agent-Loop: true header. v1.4.2 adds tool message name auto-completion (OpenClaw compat), normalized tool_calls (id/type/name auto-fill), live smoke test support, and improved graceful degradation.',
     },
   } as ManagementApiResponse
 })

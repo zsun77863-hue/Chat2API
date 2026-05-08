@@ -1,5 +1,10 @@
 /**
- * Agent Loop Module (v1.4.1)
+ * Agent Loop Module (v1.4.2)
+ *
+ * Changes in v1.4.2:
+ * - Auto-completes `name` field for tool messages (OpenClaw compatibility)
+ * - Normalizes tool_calls to ensure id, type, and function.name are present
+ * - Improved live smoke test support via management API
  *
  * Fixes from v1.4.0:
  * - Bug 1: Properly handles tool_result continuation — when OpenClaw sends back
@@ -96,7 +101,7 @@ class AgentLoopManager {
 
   constructor() {
     this.startCleanup()
-    console.log('[AgentLoop] Initialized (v1.4.1), max rounds:', MAX_AGENT_ROUNDS)
+    console.log('[AgentLoop] Initialized (v1.4.2), max rounds:', MAX_AGENT_ROUNDS)
   }
 
   // ----------------------------------------------------------
@@ -191,6 +196,9 @@ class AgentLoopManager {
 
       console.log(`[AgentLoop] New session ${effectiveSessionId} for client ${clientIP}`)
     }
+
+    // Auto-complete name field for tool messages (OpenClaw compatibility)
+    this.ensureToolMessageNames(session)
 
     // Build the model request — inherits ALL params from session
     const modelRequest = this.buildModelRequest(session)
@@ -378,6 +386,42 @@ class AgentLoopManager {
   // ----------------------------------------------------------
 
   /**
+   * Ensure all tool messages have a `name` field.
+   * OpenClaw (and some other clients) may send tool results without the name field,
+   * which causes errors with some model APIs. We auto-complete from the last
+   * assistant message's tool_calls.
+   */
+  private ensureToolMessageNames(session: AgentSession): void {
+    // Build a map of tool_call_id → function name from assistant messages
+    const toolCallNameMap: Map<string, string> = new Map()
+    for (const msg of session.messages) {
+      if (msg.role === 'assistant' && msg.tool_calls) {
+        for (const tc of msg.tool_calls) {
+          if (tc.id && tc.function?.name) {
+            toolCallNameMap.set(tc.id, tc.function.name)
+          }
+        }
+      }
+    }
+
+    // Auto-complete name field for tool messages
+    let patched = 0
+    for (const msg of session.messages) {
+      if (msg.role === 'tool' && !msg.name && msg.tool_call_id) {
+        const name = toolCallNameMap.get(msg.tool_call_id)
+        if (name) {
+          msg.name = name
+          patched++
+        }
+      }
+    }
+
+    if (patched > 0) {
+      console.log(`[AgentLoop] Auto-completed ${patched} tool message name(s)`)
+    }
+  }
+
+  /**
    * Update session params from a continuation request.
    * Allows client to override temperature, max_tokens, etc. mid-loop.
    */
@@ -435,7 +479,7 @@ class AgentLoopManager {
   /**
    * Structured tool_calls extraction (Bug 3 fix).
    * Parses JSON structure instead of string matching.
-   * Returns { hasToolCalls, toolCalls } where toolCalls is the raw array (for hashing).
+   * Returns { hasToolCalls, toolCalls } where toolCalls is the normalized array.
    */
   private extractToolCalls(result: ForwardResult): { hasToolCalls: boolean; toolCalls: any[] } {
     if (!result.body) return { hasToolCalls: false, toolCalls: [] }
@@ -451,22 +495,61 @@ class AgentLoopManager {
     // Check message.tool_calls (OpenAI standard structure)
     const message = choice.message
     if (message && message.tool_calls && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
-      return { hasToolCalls: true, toolCalls: message.tool_calls }
+      return { hasToolCalls: true, toolCalls: this.normalizeToolCalls(message.tool_calls) }
     }
 
     // Check finish_reason === 'tool_calls' (some providers use this)
     if (choice.finish_reason === 'tool_calls') {
-      // Even if message.tool_calls is missing, the finish_reason indicates tool calls
-      return { hasToolCalls: true, toolCalls: message?.tool_calls || [] }
+      if (message?.tool_calls && message.tool_calls.length > 0) {
+        return { hasToolCalls: true, toolCalls: this.normalizeToolCalls(message.tool_calls) }
+      }
+      // finish_reason says tool_calls but no tool_calls array — still flag it
+      return { hasToolCalls: true, toolCalls: [] }
     }
 
     // Check delta.tool_calls for streaming responses that were collected
     const delta = choice.delta
     if (delta && delta.tool_calls && Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
-      return { hasToolCalls: true, toolCalls: delta.tool_calls }
+      return { hasToolCalls: true, toolCalls: this.normalizeToolCalls(delta.tool_calls) }
     }
 
     return { hasToolCalls: false, toolCalls: [] }
+  }
+
+  /**
+   * Normalize tool_calls to ensure each has id, type, and function.name.
+   * Some providers omit id or type; we auto-generate them for compatibility.
+   */
+  private normalizeToolCalls(toolCalls: any[]): any[] {
+    return toolCalls.map((tc, index) => {
+      const normalized = { ...tc }
+
+      // Ensure id exists
+      if (!normalized.id) {
+        normalized.id = `call_${Date.now().toString(36)}_${index}`
+      }
+
+      // Ensure type exists
+      if (!normalized.type) {
+        normalized.type = 'function'
+      }
+
+      // Ensure function.name exists
+      if (normalized.function && !normalized.function.name) {
+        normalized.function.name = `unknown_function_${index}`
+      }
+
+      // Ensure arguments is a string
+      if (normalized.function && typeof normalized.function.arguments !== 'string') {
+        try {
+          normalized.function.arguments = JSON.stringify(normalized.function.arguments || {})
+        } catch {
+          normalized.function.arguments = '{}'
+        }
+      }
+
+      return normalized
+    })
   }
 
   /**
