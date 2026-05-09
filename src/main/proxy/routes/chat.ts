@@ -18,6 +18,7 @@ import {
   transformResponseToAnthropic,
   transformChunkToAnthropic
 } from '../utils/toolFormatConverter'
+import { agentLoopManager } from '../agentLoop'
 
 const router = new Router({ prefix: '/v1/chat' })
 
@@ -177,6 +178,61 @@ router.post('/completions', async (ctx: Context) => {
   }
 
   proxyStatusManager.recordRequestStart(request.model, provider.id, account.id)
+
+  // ============================================================
+  // Agent Loop Mode - 多轮工具调用自动循环（默认自动启用）
+  // 只要请求体包含 tools 定义，即自动激活 Agent 循环
+  // 可通过请求头 X-Agent-Mode: false 手动关闭
+  // 激活后：缓存会话上下文 → 检测 tool_calls → 自动推进多轮循环
+  // ============================================================
+  const agentModeEnabled = agentLoopManager.shouldEnable(request, ctx.headers as any)
+  let agentSessionId: string | undefined
+
+  if (agentModeEnabled) {
+    const isCont = agentLoopManager.isContinuation(request, ctx.headers as any)
+
+    if (isCont) {
+      // ---- 续接模式：前端回传了工具执行结果 ----
+      agentSessionId = (ctx.headers as any)['x-session-id'] as string
+      const session = agentLoopManager.appendToolResults(agentSessionId, request)
+
+      if (!session) {
+        console.warn('[Chat] Agent session not found for continuation, falling back to normal mode')
+        agentSessionId = undefined
+      } else if (agentLoopManager.isMaxRoundsExceeded(agentSessionId)) {
+        const maxR = agentLoopManager.getMaxRounds(agentSessionId)
+        console.warn(`[Chat] Agent max rounds exceeded (${maxR}), returning error`)
+        proxyStatusManager.recordRequestFailure(Date.now() - startTime)
+        ctx.status = 400
+        ctx.set('X-Agent-Loop', 'max_rounds_exceeded')
+        ctx.set('X-Agent-Round', String(maxR))
+        ctx.body = {
+          error: {
+            message: `Agent loop exceeded maximum rounds (${maxR}). The task may be too complex or there may be an infinite tool calling loop.`,
+            type: 'agent_loop_error',
+            param: null,
+            code: 'max_rounds_exceeded',
+          },
+        }
+        agentLoopManager.deleteSession(agentSessionId)
+        return
+      } else {
+        // 使用会话中缓存的完整消息历史构建下一轮请求
+        const nextRequest = agentLoopManager.buildNextRequest(session, request)
+        request.messages = nextRequest.messages
+        if (nextRequest.tools) request.tools = nextRequest.tools
+        if (nextRequest.tool_choice !== undefined) request.tool_choice = nextRequest.tool_choice
+        request.stream = false // Agent 循环内部强制非流式，以便完整解析 tool_calls
+        console.log(`[Chat] Agent continuation: session=${agentSessionId}, round=${agentLoopManager.getRoundCount(agentSessionId)}, messages=${request.messages.length}`)
+      }
+    } else {
+      // ---- 新会话模式 ----
+      agentSessionId = agentLoopManager.generateSessionId()
+      agentLoopManager.createSession(agentSessionId, request)
+      request.stream = false // Agent 循环内部强制非流式
+      console.log(`[Chat] Agent new session created: ${agentSessionId}`)
+    }
+  }
 
   try {
     const result = await requestForwarder.forwardChatCompletion(
@@ -433,6 +489,27 @@ router.post('/completions', async (ctx: Context) => {
           console.log('[Chat] Transformed response to Anthropic tool format')
         } else {
           ctx.body = result.body
+        }
+
+        // ============================================================
+        // Agent Loop: 检测模型响应中的 tool_calls，更新会话状态
+        // ============================================================
+        if (agentModeEnabled && agentSessionId && result.body) {
+          const hasToolCalls = agentLoopManager.processModelResponse(agentSessionId, result.body)
+
+          if (hasToolCalls) {
+            // 响应包含 tool_calls → 会话保持活跃，等待前端回传工具执行结果
+            ctx.set('X-Session-Id', agentSessionId)
+            ctx.set('X-Agent-Loop', 'waiting_tool_result')
+            ctx.set('X-Agent-Round', String(agentLoopManager.getRoundCount(agentSessionId)))
+            console.log(`[Chat] Agent: tool_calls detected, waiting for tool results. Session: ${agentSessionId}, Round: ${agentLoopManager.getRoundCount(agentSessionId)}`)
+          } else {
+            // 模型输出最终文本回复 → 循环结束，会话已自动清理
+            ctx.set('X-Session-Id', agentSessionId || '')
+            ctx.set('X-Agent-Loop', 'completed')
+            ctx.set('X-Agent-Round', String(agentLoopManager.getRoundCount(agentSessionId)))
+            console.log(`[Chat] Agent: final response received, loop completed. Session: ${agentSessionId}, Total rounds: ${agentLoopManager.getRoundCount(agentSessionId)}`)
+          }
         }
       } else {
         ctx.body = {
