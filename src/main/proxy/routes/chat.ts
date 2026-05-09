@@ -18,6 +18,7 @@ import {
   transformResponseToAnthropic,
   transformChunkToAnthropic
 } from '../utils/toolFormatConverter'
+import { agentLoopManager } from '../agentLoop'
 
 const router = new Router({ prefix: '/v1/chat' })
 
@@ -178,6 +179,65 @@ router.post('/completions', async (ctx: Context) => {
 
   proxyStatusManager.recordRequestStart(request.model, provider.id, account.id)
 
+  // ============================================================
+  // Agent Loop Mode - 多轮工具调用自动循环（默认自动启用）
+  // 只要请求体包含 tools 定义，即自动激活 Agent 循环
+  // 可通过请求头 X-Agent-Mode: false 手动关闭
+  // 激活后：缓存会话上下文 → 检测 tool_calls → 自动推进多轮循环
+  // ============================================================
+  const agentModeEnabled = agentLoopManager.shouldEnable(request, ctx.headers as any)
+  let agentSessionId: string | undefined
+  // 保存客户端原始的 stream 设置，用于决定响应格式
+  const clientWantsStream = request.stream === true
+
+  if (agentModeEnabled) {
+    const isCont = agentLoopManager.isContinuation(request, ctx.headers as any)
+
+    if (isCont) {
+      // ---- 续接模式：前端回传了工具执行结果 ----
+      agentSessionId = agentLoopManager.resolveSessionId(request, ctx.headers as any)
+      const session = agentSessionId ? agentLoopManager.appendToolResults(agentSessionId, request) : null
+
+      if (!session || !agentSessionId) {
+        console.warn('[Chat] Agent session not found for continuation, falling back to normal mode')
+        agentSessionId = undefined
+      } else if (agentLoopManager.isMaxRoundsExceeded(agentSessionId)) {
+        const maxR = agentLoopManager.getMaxRounds(agentSessionId)
+        console.warn(`[Chat] Agent max rounds exceeded (${maxR}), returning error`)
+        proxyStatusManager.recordRequestFailure(Date.now() - startTime)
+        ctx.status = 400
+        ctx.set('X-Agent-Loop', 'max_rounds_exceeded')
+        ctx.set('X-Agent-Round', String(maxR))
+        ctx.body = {
+          error: {
+            message: `Agent loop exceeded maximum rounds (${maxR}). The task may be too complex or there may be an infinite tool calling loop.`,
+            type: 'agent_loop_error',
+            param: null,
+            code: 'max_rounds_exceeded',
+          },
+        }
+        agentLoopManager.deleteSession(agentSessionId)
+        return
+      } else {
+        // 使用会话中缓存的完整消息历史构建下一轮请求
+        const nextRequest = agentLoopManager.buildNextRequest(session, request)
+        request.messages = nextRequest.messages
+        if (nextRequest.tools) request.tools = nextRequest.tools
+        if (nextRequest.tool_choice !== undefined) request.tool_choice = nextRequest.tool_choice
+        console.log(`[Chat] Agent continuation: session=${agentSessionId}, round=${agentLoopManager.getRoundCount(agentSessionId)}, messages=${request.messages.length}`)
+      }
+    } else {
+      // ---- 新会话模式 ----
+      agentSessionId = agentLoopManager.generateSessionId()
+      agentLoopManager.createSession(agentSessionId, request)
+      console.log(`[Chat] Agent new session created: ${agentSessionId}`)
+    }
+
+    // Agent 循环内部强制非流式请求，以便完整解析 tool_calls
+    // 但不修改 request.stream，因为后续响应格式仍按客户端原始要求返回
+    request.stream = false
+  }
+
   try {
     const result = await requestForwarder.forwardChatCompletion(
       request,
@@ -331,7 +391,8 @@ router.post('/completions', async (ctx: Context) => {
 
     storeManager.recordRequestInStats(true, latency, request.model, provider.id, account.id)
 
-    if (request.stream === true && result.stream) {
+    if ((clientWantsStream || request.stream === true) && result.stream) {
+      // 客户端要求流式，且后端返回了流 → 正常流式响应
       ctx.set('Content-Type', 'text/event-stream')
       ctx.set('Cache-Control', 'no-cache')
       ctx.set('Connection', 'keep-alive')
@@ -424,35 +485,174 @@ router.post('/completions', async (ctx: Context) => {
 
       ctx.body = wrapperStream
     } else {
-      ctx.set('Content-Type', 'application/json')
+      // ============================================================
+      // 非流式响应（或 Agent 模式下强制非流式请求的结果）
+      // ============================================================
 
-      if (result.body) {
-        // Check if we need to transform to Anthropic format
-        if (isAnthropicToolFormat(request.tool_format)) {
-          ctx.body = transformResponseToAnthropic(result.body)
-          console.log('[Chat] Transformed response to Anthropic tool format')
-        } else {
-          ctx.body = result.body
+      // Agent 模式：客户端要求流式，但内部用了非流式请求 → 需要把 JSON 转为 SSE 格式
+      if (agentModeEnabled && clientWantsStream && result.body) {
+        // 先处理 Agent 会话状态
+        if (agentSessionId) {
+          const hasToolCalls = agentLoopManager.processModelResponse(agentSessionId, result.body)
+          if (hasToolCalls) {
+            ctx.set('X-Session-Id', agentSessionId)
+            ctx.set('X-Agent-Loop', 'waiting_tool_result')
+            ctx.set('X-Agent-Round', String(agentLoopManager.getRoundCount(agentSessionId)))
+          } else {
+            ctx.set('X-Session-Id', agentSessionId)
+            ctx.set('X-Agent-Loop', 'completed')
+            ctx.set('X-Agent-Round', String(agentLoopManager.getRoundCount(agentSessionId)))
+          }
         }
+
+        // 将 JSON 响应转换为 SSE 流式格式返回给客户端
+        ctx.set('Content-Type', 'text/event-stream')
+        ctx.set('Cache-Control', 'no-cache')
+        ctx.set('Connection', 'keep-alive')
+        ctx.set('X-Accel-Buffering', 'no')
+
+        const responseBody = isAnthropicToolFormat(request.tool_format)
+          ? transformResponseToAnthropic(result.body)
+          : result.body
+
+        const sseStream = streamHandler.createPassThrough()
+
+        // 将完整响应拆分为 SSE chunk 格式
+        const message = responseBody?.choices?.[0]?.message
+        if (message) {
+          // 第一个 chunk: role
+          sseStream.write(`data: ${JSON.stringify({
+            id: responseBody?.id || requestId,
+            object: 'chat.completion.chunk',
+            created: responseBody?.created || Math.floor(Date.now() / 1000),
+            model: responseBody?.model || actualModel,
+            choices: [{
+              index: 0,
+              delta: { role: 'assistant' },
+              finish_reason: null,
+            }],
+          })}\n\n`)
+
+          // 第二个 chunk: content
+          if (message.content) {
+            sseStream.write(`data: ${JSON.stringify({
+              id: responseBody?.id || requestId,
+              object: 'chat.completion.chunk',
+              created: responseBody?.created || Math.floor(Date.now() / 1000),
+              model: responseBody?.model || actualModel,
+              choices: [{
+                index: 0,
+                delta: { content: message.content },
+                finish_reason: null,
+              }],
+            })}\n\n`)
+          }
+
+          // 第三个 chunk: tool_calls（如果有）
+          if (message.tool_calls && message.tool_calls.length > 0) {
+            for (const tc of message.tool_calls) {
+              sseStream.write(`data: ${JSON.stringify({
+                id: responseBody?.id || requestId,
+                object: 'chat.completion.chunk',
+                created: responseBody?.created || Math.floor(Date.now() / 1000),
+                model: responseBody?.model || actualModel,
+                choices: [{
+                  index: 0,
+                  delta: {
+                    tool_calls: [{
+                      index: tc.index || 0,
+                      id: tc.id,
+                      type: 'function',
+                      function: { name: tc.function.name, arguments: tc.function.arguments },
+                    }],
+                  },
+                  finish_reason: null,
+                }],
+              })}\n\n`)
+            }
+          }
+
+          // 最后一个 chunk: finish_reason
+          const finishReason = message.tool_calls?.length > 0 ? 'tool_calls' : 'stop'
+          sseStream.write(`data: ${JSON.stringify({
+            id: responseBody?.id || requestId,
+            object: 'chat.completion.chunk',
+            created: responseBody?.created || Math.floor(Date.now() / 1000),
+            model: responseBody?.model || actualModel,
+            choices: [{
+              index: 0,
+              delta: {},
+              finish_reason: finishReason,
+            }],
+          })}\n\n`)
+        }
+
+        // [DONE] 标记
+        sseStream.write('data: [DONE]\n\n')
+        sseStream.end()
+        ctx.body = sseStream
+
+        // 记录日志
+        if (logEntryId) {
+          storeManager.updateRequestLog(logEntryId, {
+            responseBody: JSON.stringify(responseBody),
+          })
+        }
+
+        console.log(`[Chat] Agent: converted non-stream response to SSE for streaming client`)
       } else {
-        ctx.body = {
-          id: requestId,
-          object: 'chat.completion',
-          created: Math.floor(Date.now() / 1000),
-          model: actualModel,
-          choices: [{
-            index: 0,
-            message: {
-              role: 'assistant',
-              content: '',
+        // 标准非流式响应
+        ctx.set('Content-Type', 'application/json')
+
+        if (result.body) {
+          // Check if we need to transform to Anthropic format
+          if (isAnthropicToolFormat(request.tool_format)) {
+            ctx.body = transformResponseToAnthropic(result.body)
+            console.log('[Chat] Transformed response to Anthropic tool format')
+          } else {
+            ctx.body = result.body
+          }
+
+          // ============================================================
+          // Agent Loop: 检测模型响应中的 tool_calls，更新会话状态
+          // ============================================================
+          if (agentModeEnabled && agentSessionId && result.body) {
+            const hasToolCalls = agentLoopManager.processModelResponse(agentSessionId, result.body)
+
+            if (hasToolCalls) {
+              // 响应包含 tool_calls → 会话保持活跃，等待前端回传工具执行结果
+              ctx.set('X-Session-Id', agentSessionId)
+              ctx.set('X-Agent-Loop', 'waiting_tool_result')
+              ctx.set('X-Agent-Round', String(agentLoopManager.getRoundCount(agentSessionId)))
+              console.log(`[Chat] Agent: tool_calls detected, waiting for tool results. Session: ${agentSessionId}, Round: ${agentLoopManager.getRoundCount(agentSessionId)}`)
+            } else {
+              // 模型输出最终文本回复 → 循环结束，会话已自动清理
+              ctx.set('X-Session-Id', agentSessionId || '')
+              ctx.set('X-Agent-Loop', 'completed')
+              ctx.set('X-Agent-Round', String(agentLoopManager.getRoundCount(agentSessionId)))
+              console.log(`[Chat] Agent: final response received, loop completed. Session: ${agentSessionId}, Total rounds: ${agentLoopManager.getRoundCount(agentSessionId)}`)
+            }
+          }
+        } else {
+          ctx.body = {
+            id: requestId,
+            object: 'chat.completion',
+            created: Math.floor(Date.now() / 1000),
+            model: actualModel,
+            choices: [{
+              index: 0,
+              message: {
+                role: 'assistant',
+                content: '',
+              },
+              finish_reason: 'stop',
+            }],
+            usage: {
+              prompt_tokens: 0,
+              completion_tokens: 0,
+              total_tokens: 0,
             },
-            finish_reason: 'stop',
-          }],
-          usage: {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-          },
+          }
         }
       }
     }
