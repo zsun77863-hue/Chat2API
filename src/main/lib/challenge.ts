@@ -71,6 +71,10 @@ export class DeepSeekHash {
       throw new Error('Unsupported algorithm: ' + algorithm)
     }
 
+    if (!this.wasmInstance) {
+      throw new Error('WASM instance not initialized. Call init() first.')
+    }
+
     const prefix = `${salt}_${expireAt}_`
 
     try {
@@ -116,10 +120,22 @@ export class DeepSeekHash {
 }
 
 let deepSeekHashInstance: DeepSeekHash | null = null
+let deepSeekHashInitPromise: Promise<DeepSeekHash> | null = null
 
 export async function getDeepSeekHash(): Promise<DeepSeekHash> {
-  if (!deepSeekHashInstance) {
-    deepSeekHashInstance = new DeepSeekHash()
+  // If already initialized successfully, return the instance
+  if (deepSeekHashInstance && (deepSeekHashInstance as any).wasmInstance) {
+    return deepSeekHashInstance
+  }
+
+  // If initialization is in progress, wait for it
+  if (deepSeekHashInitPromise) {
+    return deepSeekHashInitPromise
+  }
+
+  // Start initialization
+  deepSeekHashInitPromise = (async () => {
+    const instance = new DeepSeekHash()
     // Use different paths for development and production environments
     const wasmPath = app.isPackaged
       ? path.join(process.resourcesPath, 'sha3_wasm_bg.7b9ca65ddd.wasm')
@@ -127,14 +143,20 @@ export async function getDeepSeekHash(): Promise<DeepSeekHash> {
     console.log('[DeepSeekHash] WASM path:', wasmPath)
     console.log('[DeepSeekHash] File exists:', fs.existsSync(wasmPath))
     try {
-      await deepSeekHashInstance.init(wasmPath)
+      await instance.init(wasmPath)
       console.log('[DeepSeekHash] WASM initialized successfully')
+      deepSeekHashInstance = instance
+      return instance
     } catch (error) {
       console.error('[DeepSeekHash] WASM initialization failed:', error)
+      // Reset both instance and promise so next call will retry
+      deepSeekHashInstance = null
+      deepSeekHashInitPromise = null
       throw error
     }
-  }
-  return deepSeekHashInstance
+  })()
+
+  return deepSeekHashInitPromise
 }
 
 export default DeepSeekHash

@@ -266,23 +266,28 @@ export class DeepSeekAdapter {
     
     console.log('[DeepSeek] Challenge parameters:', { difficulty })
     
-    const deepSeekHash = await getDeepSeekHash()
-    const answer = deepSeekHash.calculateHash(algorithm, challengeStr, salt, difficulty, expire_at)
-    
-    if (answer === undefined) {
-      throw new Error('Challenge calculation failed')
-    }
-    
-    console.log('[DeepSeek] Challenge answer found:', answer)
+    try {
+      const deepSeekHash = await getDeepSeekHash()
+      const answer = deepSeekHash.calculateHash(algorithm, challengeStr, salt, difficulty, expire_at)
+      
+      if (answer === undefined) {
+        throw new Error('Challenge calculation failed')
+      }
+      
+      console.log('[DeepSeek] Challenge answer found:', answer)
 
-    return Buffer.from(JSON.stringify({
-      algorithm,
-      challenge: challengeStr,
-      salt,
-      answer,
-      signature,
-      target_path: '/api/v0/chat/completion',
-    })).toString('base64')
+      return Buffer.from(JSON.stringify({
+        algorithm,
+        challenge: challengeStr,
+        salt,
+        answer,
+        signature,
+        target_path: '/api/v0/chat/completion',
+      })).toString('base64')
+    } catch (error: any) {
+      console.error('[DeepSeek] Challenge calculation error:', error.message)
+      throw new Error(`DeepSeek challenge calculation failed: ${error.message}. This may be due to WASM initialization failure. Please restart the application.`)
+    }
   }
 
   private messagesToPrompt(messages: DeepSeekMessage[], isMultiTurn: boolean = false): string {
