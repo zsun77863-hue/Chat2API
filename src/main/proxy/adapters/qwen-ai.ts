@@ -737,12 +737,23 @@ export class QwenAiStreamHandler {
         console.error('[QwenAI] Non-stream error:', err)
         rejectOnce(err)
       })
+      stream.once('end', () => {
+        // 流正常结束，确保 resolve（即使没有收到 answer finished 信号）
+        // 思考模式下可能只有 think 阶段没有 answer 阶段
+        const finalReasoning = reasoningText || summaryText
+        if (finalReasoning) {
+          data.choices[0].message.reasoning_content = finalReasoning
+        }
+        console.log('[QwenAI] Non-stream ended, content length:', data.choices[0].message.content.length, 'reasoning length:', finalReasoning.length)
+        resolveOnce(data)
+      })
       stream.once('close', () => {
         // Use reasoningText or summaryText for reasoning_content
         const finalReasoning = reasoningText || summaryText
         if (finalReasoning) {
           data.choices[0].message.reasoning_content = finalReasoning
         }
+        console.log('[QwenAI] Non-stream closed, content length:', data.choices[0].message.content.length)
         resolveOnce(data)
       })
     })

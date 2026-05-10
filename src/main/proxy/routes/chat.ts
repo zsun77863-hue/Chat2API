@@ -533,7 +533,22 @@ router.post('/completions', async (ctx: Context) => {
             }],
           })}\n\n`)
 
-          // 第二个 chunk: content
+          // 第二个 chunk: reasoning_content（思考内容，如果有）
+          if (message.reasoning_content) {
+            sseStream.write(`data: ${JSON.stringify({
+              id: responseBody?.id || requestId,
+              object: 'chat.completion.chunk',
+              created: responseBody?.created || Math.floor(Date.now() / 1000),
+              model: responseBody?.model || actualModel,
+              choices: [{
+                index: 0,
+                delta: { reasoning_content: message.reasoning_content },
+                finish_reason: null,
+              }],
+            })}\n\n`)
+          }
+
+          // 第三个 chunk: content（正文内容）
           if (message.content) {
             sseStream.write(`data: ${JSON.stringify({
               id: responseBody?.id || requestId,

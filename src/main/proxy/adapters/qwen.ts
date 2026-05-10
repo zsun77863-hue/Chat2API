@@ -866,33 +866,33 @@ export class QwenStreamHandler {
                   }
 
                   if (msg.status === 'complete' || msg.status === 'finished') {
-                    if (msg.mime_type === 'multi_load/iframe') {
-                      console.log('[Qwen] Non-stream finished, content length:', contentAccumulator.length)
-                      this.content = contentAccumulator
-                      
-                      // Parse tool calls from content
-                      const { content: cleanContent, toolCalls } = this.toolCallingPlan?.shouldParseResponse
-                        ? { content: contentAccumulator, toolCalls: [] }
-                        : parseToolCallsFromText(contentAccumulator, 'qwen')
-                      
-                      if (toolCalls.length > 0) {
-                        data.choices[0].message.content = null
-                        ;(data.choices[0].message as any).tool_calls = toolCalls
-                        data.choices[0].finish_reason = 'tool_calls'
-                      } else {
-                        data.choices[0].message.content = cleanContent.trim()
-                      }
-                      
-                      // Add reasoning_content if available
-                      if (thinkingAccumulator) {
-                        data.choices[0].message.reasoning_content = thinkingAccumulator
-                      }
-                      
-                      this.onEnd?.(this.sessionId)
-                      resolved = true
-                      resolve(data)
-                      return
+                    // 支持 multi_load/iframe 和 text/plain 两种完成信号
+                    // 思考模式下 Qwen 可能用 text/plain 发送完成信号
+                    console.log('[Qwen] Non-stream finished, mime_type:', msg.mime_type, 'content length:', contentAccumulator.length)
+                    this.content = contentAccumulator
+                    
+                    // Parse tool calls from content
+                    const { content: cleanContent, toolCalls } = this.toolCallingPlan?.shouldParseResponse
+                      ? { content: contentAccumulator, toolCalls: [] }
+                      : parseToolCallsFromText(contentAccumulator, 'qwen')
+                    
+                    if (toolCalls.length > 0) {
+                      data.choices[0].message.content = null
+                      ;(data.choices[0].message as any).tool_calls = toolCalls
+                      data.choices[0].finish_reason = 'tool_calls'
+                    } else {
+                      data.choices[0].message.content = cleanContent.trim()
                     }
+                    
+                    // Add reasoning_content if available
+                    if (thinkingAccumulator) {
+                      data.choices[0].message.reasoning_content = thinkingAccumulator
+                    }
+                    
+                    this.onEnd?.(this.sessionId)
+                    resolved = true
+                    resolve(data)
+                    return
                   }
                 }
               }
