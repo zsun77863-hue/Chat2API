@@ -181,7 +181,8 @@
       ],
       "icon": "build/icon.ico",
       "artifactName": "${productName}-${version}-${arch}-setup.${ext}",
-      "sign": false
+      "sign": false,
+      "signAndEditExecutable": false
     },
     "nsis": {
       "oneClick": false,
