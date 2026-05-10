@@ -20,6 +20,12 @@ export interface ClaudeMessageRequest {
   top_k?: number
   tools?: ClaudeTool[]
   tool_choice?: ClaudeToolChoice
+  thinking?: ClaudeThinkingConfig
+}
+
+export interface ClaudeThinkingConfig {
+  type: 'enabled' | 'disabled'
+  budget_tokens?: number
 }
 
 export interface ClaudeMetadata {

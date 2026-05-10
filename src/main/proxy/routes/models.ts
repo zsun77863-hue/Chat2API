@@ -13,6 +13,21 @@ import { modelMapper } from '../modelMapper'
 const router = new Router({ prefix: '/v1' })
 
 /**
+ * Built-in Claude models for Claude Code compatibility
+ * These models are always available in /v1/models so that
+ * Claude Code and other Anthropic-compatible clients can discover them.
+ */
+const CLAUDE_BUILTIN_MODELS: ModelInfo[] = [
+  { id: 'claude-opus-4-20250514', object: 'model', created: 1747267200, owned_by: 'anthropic' },
+  { id: 'claude-sonnet-4-20250514', object: 'model', created: 1747267200, owned_by: 'anthropic' },
+  { id: 'claude-sonnet-4-5-20250514', object: 'model', created: 1747267200, owned_by: 'anthropic' },
+  { id: 'claude-haiku-4-5-20251001', object: 'model', created: 1759334400, owned_by: 'anthropic' },
+  { id: 'claude-3-5-sonnet-20241022', object: 'model', created: 1729555200, owned_by: 'anthropic' },
+  { id: 'claude-3-5-haiku-20241022', object: 'model', created: 1729555200, owned_by: 'anthropic' },
+  { id: 'claude-3-opus-20240229', object: 'model', created: 1709164800, owned_by: 'anthropic' },
+]
+
+/**
  * Get all available models
  */
 router.get('/models', async (ctx: Context) => {
@@ -56,6 +71,14 @@ router.get('/models', async (ctx: Context) => {
     }
   }
 
+  // Add built-in Claude models for Claude Code compatibility
+  for (const claudeModel of CLAUDE_BUILTIN_MODELS) {
+    if (!addedModels.has(claudeModel.id)) {
+      addedModels.add(claudeModel.id)
+      models.push(claudeModel)
+    }
+  }
+
   const response: ModelsResponse = {
     object: 'list',
     data: models,
@@ -70,6 +93,14 @@ router.get('/models', async (ctx: Context) => {
  */
 router.get('/models/:model', async (ctx: Context) => {
   const modelId = ctx.params.model
+
+  // Check built-in Claude models first
+  const claudeModel = CLAUDE_BUILTIN_MODELS.find(m => m.id === modelId)
+  if (claudeModel) {
+    ctx.set('Content-Type', 'application/json')
+    ctx.body = claudeModel
+    return
+  }
 
   const config = storeManager.getConfig()
   const mappings = config.modelMappings || {}
