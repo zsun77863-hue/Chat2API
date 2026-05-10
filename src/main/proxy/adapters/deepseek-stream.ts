@@ -1,6 +1,10 @@
 /**
  * DeepSeek Stream Response Handler
  * Converts DeepSeek SSE stream to OpenAI compatible format
+ * 
+ * v1.7.2 改进：
+ * - 过滤内部系统标记（<|end of sentence|>、<|toolresult>等）
+ * - 不将内部标记暴露给前端用户
  */
 
 import { PassThrough } from 'stream'
@@ -8,6 +12,7 @@ import { parseToolCallsFromText } from '../utils/toolParser'
 import { createBaseChunk } from '../utils/streamToolHandler'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
 import type { ToolCallingPlan } from '../toolCalling/types'
+import { filterInternalMarkers, isOnlyInternalMarkers } from '../agentLoop'
 
 const MODEL_NAME = 'deepseek-chat'
 
@@ -238,12 +243,16 @@ export class DeepSeekStreamHandler {
     isFoldModel: boolean,
     isSearchSilentModel: boolean
   ): void {
-    const cleanedValue = content.replace(/FINISHED/g, '')
+    // v1.7.2: 过滤内部系统标记
+    const cleanedValue = filterInternalMarkers(content.replace(/FINISHED/g, ''))
     // Always filter SEARCH keywords for thinking content
     const filteredForSearch = cleanedValue.replace(/^(SEARCH|WEB_SEARCH|SEARCHING)\s*/i, '')
     const processedContent = isSearchSilentModel
       ? filteredForSearch.replace(/\[citation:(\d+)\]/g, '')
       : filteredForSearch.replace(/\[citation:(\d+)\]/g, '[$1]')
+
+    // v1.7.2: 如果过滤后内容为空（只有内部标记），跳过发送
+    if (!processedContent || isOnlyInternalMarkers(content)) return
 
     // For 'content' path, intercept tool calls before text is streamed.
     if ((path === 'content' || path === '') && this.toolStreamParser) {
@@ -463,6 +472,10 @@ export class DeepSeekStreamHandler {
       })
 
       stream.on('end', () => {
+        // v1.7.2: 过滤内部系统标记
+        accumulatedContent = filterInternalMarkers(accumulatedContent)
+        accumulatedThinkingContent = filterInternalMarkers(accumulatedThinkingContent)
+
         // Parse tool calls from accumulated content
         const { content: cleanContent, toolCalls } = this.toolCallingPlan?.shouldParseResponse
           ? { content: accumulatedContent, toolCalls: [] }

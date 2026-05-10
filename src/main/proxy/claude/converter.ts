@@ -265,6 +265,14 @@ export function openaiResponseToClaude(
   const message = choice.message
   const content: ClaudeContentBlock[] = []
 
+  // Add thinking content (reasoning_content from DeepSeek thinking models)
+  if ((message as any)?.reasoning_content) {
+    content.push({
+      type: 'thinking',
+      thinking: (message as any).reasoning_content,
+    })
+  }
+
   // Add text content
   if (message?.content) {
     content.push({
@@ -415,9 +423,37 @@ export class ClaudeStreamConverter {
     }
 
     // Handle role delta (first chunk usually)
-    if (delta?.role === 'assistant' && !delta.content && !delta.tool_calls) {
+    if (delta?.role === 'assistant' && !delta.content && !delta.tool_calls && !delta.reasoning_content) {
       // Just the role announcement, no content yet
       return events
+    }
+
+    // Handle reasoning_content (thinking) - convert to Claude thinking blocks
+    if (delta?.reasoning_content) {
+      // Start a new thinking block if needed
+      if (this.currentContentBlockType !== 'thinking') {
+        // Close previous block if any
+        if (this.currentContentBlockIndex >= 0) {
+          events.push(this.formatEvent({
+            type: 'content_block_stop',
+            index: this.currentContentBlockIndex,
+          }))
+        }
+        this.currentContentBlockIndex++
+        this.currentContentBlockType = 'thinking'
+        events.push(this.formatEvent({
+          type: 'content_block_start',
+          index: this.currentContentBlockIndex,
+          content_block: { type: 'thinking', thinking: '' },
+        }))
+      }
+      // Send thinking delta
+      events.push(this.formatEvent({
+        type: 'content_block_delta',
+        index: this.currentContentBlockIndex,
+        delta: { type: 'thinking_delta', thinking: delta.reasoning_content },
+      }))
+      this.totalOutputTokens++
     }
 
     // Handle text content

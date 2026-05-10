@@ -38,8 +38,10 @@ export interface ClaudeMessage {
 }
 
 export interface ClaudeContentBlock {
-  type: 'text' | 'image' | 'tool_use' | 'tool_result'
+  type: 'text' | 'image' | 'tool_use' | 'tool_result' | 'thinking'
   text?: string
+  thinking?: string
+  signature?: string
   source?: ClaudeImageSource
   id?: string
   name?: string
