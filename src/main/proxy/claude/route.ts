@@ -73,6 +73,125 @@ function sendClaudeError(ctx: Context, status: number, errorType: string, messag
 }
 
 /**
+ * Check if the request is a Claude Code "anthropic-skills" reminder request.
+ * Claude Code sends two requests per user interaction:
+ * 1. First request: Contains <system-reminder> with "anthropic-skills" content
+ * 2. Second request: Contains <system-reminder> with "claudeMd" content
+ * 
+ * The first request should not be forwarded to the backend model,
+ * as it would produce a duplicate response. Instead, we return a
+ * minimal "end_turn" response so Claude Code proceeds to the second request.
+ */
+function checkSkillsReminderRequest(claudeReq: ClaudeMessageRequest): boolean {
+  if (!claudeReq.messages || !Array.isArray(claudeReq.messages)) {
+    return false
+  }
+
+  for (const msg of claudeReq.messages) {
+    if (msg.role !== 'user' || !msg.content) continue
+
+    // Handle string content
+    if (typeof msg.content === 'string') {
+      if (msg.content.includes('anthropic-skills') && msg.content.includes('<system-reminder>')) {
+        return true
+      }
+    }
+
+    // Handle array content (Claude API format with content blocks)
+    if (Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block.type === 'text' && block.text) {
+          if (block.text.includes('anthropic-skills') && block.text.includes('<system-reminder>')) {
+            return true
+          }
+        }
+      }
+    }
+  }
+
+  return false
+}
+
+/**
+ * Send a minimal Claude response for the anthropic-skills reminder request.
+ * This prevents duplicate answers by returning an empty "end_turn" response,
+ * which tells Claude Code that no skills need to be executed.
+ */
+function sendClaudeSkillsReminderResponse(
+  ctx: Context,
+  requestId: string,
+  model: string,
+  isStream: boolean
+): void {
+  if (isStream) {
+    // Streaming response: send minimal Claude SSE events
+    ctx.set('Content-Type', 'text/event-stream')
+    ctx.set('Cache-Control', 'no-cache')
+    ctx.set('Connection', 'keep-alive')
+    ctx.set('X-Accel-Buffering', 'no')
+    ctx.set('X-Request-ID', requestId)
+    ctx.set('Anthropic-Ratelimit-Requests-Limit', '1000')
+    ctx.set('Anthropic-Ratelimit-Requests-Remaining', '999')
+
+    const stream = new PassThrough()
+
+    // message_start event
+    const messageStart = {
+      type: 'message_start',
+      message: {
+        id: requestId,
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model: model,
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    }
+    stream.write(`event: message_start\ndata: ${JSON.stringify(messageStart)}\n\n`)
+
+    // message_delta event with end_turn
+    const messageDelta = {
+      type: 'message_delta',
+      delta: {
+        stop_reason: 'end_turn',
+        stop_sequence: null,
+      },
+      usage: { output_tokens: 0 },
+    }
+    stream.write(`event: message_delta\ndata: ${JSON.stringify(messageDelta)}\n\n`)
+
+    // message_stop event
+    stream.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`)
+
+    // ping event
+    stream.write(`event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`)
+
+    stream.end()
+    ctx.body = stream
+  } else {
+    // Non-streaming response: return minimal Claude message
+    ctx.set('Content-Type', 'application/json')
+    ctx.set('X-Request-ID', requestId)
+    ctx.set('Anthropic-Ratelimit-Requests-Limit', '1000')
+    ctx.set('Anthropic-Ratelimit-Requests-Remaining', '999')
+
+    const response = {
+      id: requestId,
+      type: 'message' as const,
+      role: 'assistant' as const,
+      content: [] as any[],
+      model: model,
+      stop_reason: 'end_turn' as const,
+      stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    }
+    ctx.body = response
+  }
+}
+
+/**
  * Handle Claude Messages API Request
  * POST /v1/messages
  */
@@ -108,6 +227,19 @@ router.post('/messages', async (ctx: Context) => {
   const isStream = claudeReq.stream === true
 
   console.log(`[Claude] Request: model=${claudeReq.model}, stream=${isStream}, messages=${claudeReq.messages.length}, tools=${claudeReq.tools?.length || 0}`)
+
+  // ============================================================
+  // Claude Code 重复回答修复：
+  // 检测 anthropic-skills system-reminder 请求，直接返回空响应
+  // Claude Code 会发送两次请求：第一次带 anthropic-skills 提醒，
+  // 第二次带 claudeMd 提醒。第一次请求不应转发到后端，
+  // 否则会产生重复回答。
+  // ============================================================
+  const isSkillsReminderRequest = checkSkillsReminderRequest(claudeReq)
+  if (isSkillsReminderRequest) {
+    console.log(`[Claude] Detected anthropic-skills reminder request, returning minimal response to avoid duplicate answer`)
+    return sendClaudeSkillsReminderResponse(ctx, requestId, claudeReq.model, isStream)
+  }
 
   try {
     // Convert Claude request to OpenAI format
