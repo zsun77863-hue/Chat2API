@@ -41,7 +41,7 @@ export class ProxyServer {
     this.app.use(async (ctx, next) => {
       ctx.set('Access-Control-Allow-Origin', '*')
       ctx.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-      ctx.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With')
+      ctx.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, x-api-key, anthropic-version')
       ctx.set('Access-Control-Max-Age', '86400')
 
       if (ctx.method === 'OPTIONS') {
@@ -77,9 +77,10 @@ export class ProxyServer {
       
       if (config.enableApiKey && config.apiKeys && config.apiKeys.length > 0) {
         const authHeader = ctx.get('Authorization') || ''
-        const providedKey = authHeader.startsWith('Bearer ') 
+        // Support both OpenAI (Bearer) and Claude (x-api-key) authentication
+        let providedKey = authHeader.startsWith('Bearer ') 
           ? authHeader.slice(7) 
-          : (ctx.query.api_key as string) || ctx.get('X-API-Key')
+          : (ctx.query.api_key as string) || ctx.get('X-API-Key') || ctx.get('x-api-key')
         
         if (!providedKey) {
           ctx.status = 401
@@ -163,13 +164,14 @@ export class ProxyServer {
     this.router.get('/', async (ctx) => {
       ctx.body = {
         name: 'Chat2API Proxy',
-        version: '1.1.2',
-        description: 'OpenAI API compatible proxy service',
+        version: '1.6.1',
+        description: 'OpenAI API & Claude API compatible proxy service',
         endpoints: [
           'POST /v1/chat/completions',
           'GET /v1/models',
           'GET /v1/models/:model',
           'POST /v1/completions',
+          'POST /v1/messages',
         ],
       }
     })
