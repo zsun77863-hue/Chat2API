@@ -396,33 +396,28 @@ router.post('/messages', async (ctx: Context) => {
       const processStream = async () => {
         try {
           if (result.skipTransform) {
-            // Stream is already in SSE format, need to parse and convert
+            // Stream is already in SSE format, use the new processSSEChunk
+            // which handles line buffering across chunk boundaries
             for await (const chunk of result.stream as AsyncIterable<Buffer>) {
               const chunkStr = chunk.toString()
               collectedContent += chunkStr
 
-              const lines = chunkStr.split('\n')
-              for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                  const data = line.slice(6).trim()
-                  if (data === '[DONE]') {
-                    const finalEvents = converter.finalize()
-                    for (const event of finalEvents) {
-                      wrapperStream.write(event)
-                    }
-                    continue
-                  }
-                  try {
-                    const parsed = JSON.parse(data)
-                    const claudeEvents = converter.convertChunk(parsed)
-                    for (const event of claudeEvents) {
-                      wrapperStream.write(event)
-                    }
-                  } catch {
-                    // Skip unparseable chunks
-                  }
-                }
+              const output = converter.processSSEChunk(chunkStr)
+              if (output) {
+                wrapperStream.write(output)
               }
+            }
+
+            // Flush any remaining buffered lines
+            const flushOutput = converter.flushRemaining()
+            if (flushOutput) {
+              wrapperStream.write(flushOutput)
+            }
+
+            // Finalize if not already done (in case [DONE] was missing)
+            const finalEvents = converter.finalize()
+            for (const event of finalEvents) {
+              wrapperStream.write(event)
             }
           } else {
             // Stream needs transformation through streamHandler first
@@ -444,28 +439,22 @@ router.post('/messages', async (ctx: Context) => {
               const chunkStr = chunk.toString()
               collectedContent += chunkStr
 
-              const lines = chunkStr.split('\n')
-              for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                  const data = line.slice(6).trim()
-                  if (data === '[DONE]') {
-                    const finalEvents = converter.finalize()
-                    for (const event of finalEvents) {
-                      wrapperStream.write(event)
-                    }
-                    continue
-                  }
-                  try {
-                    const parsed = JSON.parse(data)
-                    const claudeEvents = converter.convertChunk(parsed)
-                    for (const event of claudeEvents) {
-                      wrapperStream.write(event)
-                    }
-                  } catch {
-                    // Skip unparseable chunks
-                  }
-                }
+              const output = converter.processSSEChunk(chunkStr)
+              if (output) {
+                wrapperStream.write(output)
               }
+            }
+
+            // Flush any remaining buffered lines
+            const flushOutput = converter.flushRemaining()
+            if (flushOutput) {
+              wrapperStream.write(flushOutput)
+            }
+
+            // Finalize if not already done
+            const finalEvents = converter.finalize()
+            for (const event of finalEvents) {
+              wrapperStream.write(event)
             }
           }
 

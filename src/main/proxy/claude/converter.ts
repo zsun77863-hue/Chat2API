@@ -369,6 +369,14 @@ function createEmptyClaudeResponse(id: string, model: string): ClaudeMessageResp
 
 /**
  * State tracker for converting OpenAI SSE stream to Claude SSE stream
+ *
+ * v1.8.1 fixes:
+ * - SSE line buffering to handle chunk boundaries
+ * - Empty string content handling (delta.content === "")
+ * - Guaranteed message_start on first valid chunk
+ * - Proper content_block_start before any content
+ * - Correct [DONE] handling with finalize
+ * - Proper stream end with message_stop
  */
 export class ClaudeStreamConverter {
   private requestId: string
@@ -380,10 +388,107 @@ export class ClaudeStreamConverter {
   private totalOutputTokens = 0
   private inputTokens = 0
   private thinkingAccumulator = ''
+  private finalized = false
+  // SSE line buffer for handling chunk boundaries
+  private lineBuffer = ''
 
   constructor(requestId: string, model: string) {
     this.requestId = requestId
     this.model = model
+  }
+
+  /**
+   * Process a raw SSE chunk string (may contain partial lines)
+   * Returns formatted Claude SSE events ready to write to the response
+   */
+  processSSEChunk(rawChunk: string): string {
+    let output = ''
+    this.lineBuffer += rawChunk
+    const lines = this.lineBuffer.split('\n')
+    // Keep the last (potentially incomplete) line in the buffer
+    this.lineBuffer = lines.pop() || ''
+
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (!trimmed.startsWith('data:')) continue
+
+      const raw = trimmed.slice(5).trim()
+
+      if (raw === '[DONE]') {
+        // If header hasn't been sent yet (extreme edge case), send it
+        if (!this.messageStarted) {
+          output += this.sendMessageStart()
+        }
+        const finalEvents = this.finalize()
+        for (const event of finalEvents) {
+          output += event
+        }
+        continue
+      }
+
+      let parsed: any
+      try {
+        parsed = JSON.parse(raw)
+      } catch {
+        continue
+      }
+
+      const claudeEvents = this.convertChunk(parsed)
+      for (const event of claudeEvents) {
+        output += event
+      }
+    }
+
+    return output
+  }
+
+  /**
+   * Flush any remaining buffered lines
+   */
+  flushRemaining(): string {
+    let output = ''
+    if (this.lineBuffer.trim()) {
+      const trimmed = this.lineBuffer.trim()
+      if (trimmed.startsWith('data:')) {
+        const raw = trimmed.slice(5).trim()
+        if (raw !== '[DONE]') {
+          try {
+            const parsed = JSON.parse(raw)
+            const claudeEvents = this.convertChunk(parsed)
+            for (const event of claudeEvents) {
+              output += event
+            }
+          } catch {
+            // Skip unparseable
+          }
+        }
+      }
+      this.lineBuffer = ''
+    }
+    return output
+  }
+
+  /**
+   * Send the message_start event
+   */
+  private sendMessageStart(): string {
+    this.messageStarted = true
+    return this.formatEvent({
+      type: 'message_start',
+      message: {
+        id: this.requestId,
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model: this.model,
+        stop_reason: null,
+        stop_sequence: null,
+        usage: {
+          input_tokens: this.inputTokens,
+          output_tokens: 0,
+        },
+      },
+    })
   }
 
   /**
@@ -399,39 +504,24 @@ export class ClaudeStreamConverter {
     const choice = chunk.choices[0]
     const delta = choice.delta
 
-    // Start message on first chunk
+    // Start message on first chunk with valid data
     if (!this.messageStarted) {
-      this.messageStarted = true
       // Extract usage from the chunk if available
       if (chunk.usage) {
         this.inputTokens = chunk.usage.prompt_tokens || 0
       }
-      events.push(this.formatEvent({
-        type: 'message_start',
-        message: {
-          id: this.requestId,
-          type: 'message',
-          role: 'assistant',
-          content: [],
-          model: this.model,
-          stop_reason: null,
-          stop_sequence: null,
-          usage: {
-            input_tokens: this.inputTokens,
-            output_tokens: 0,
-          },
-        },
-      }))
+      events.push(this.sendMessageStart())
     }
 
-    // Handle role delta (first chunk usually)
-    if (delta?.role === 'assistant' && !delta.content && !delta.tool_calls && !delta.reasoning_content) {
+    // Handle role delta (first chunk usually) - still need to ensure message_start is sent
+    if (delta?.role === 'assistant' && delta.content == null && !delta.tool_calls && !delta.reasoning_content) {
       // Just the role announcement, no content yet
+      // But we've already sent message_start, so this is fine
       return events
     }
 
     // Handle reasoning_content (thinking) - convert to Claude thinking blocks
-    if (delta?.reasoning_content) {
+    if (delta?.reasoning_content != null) {
       // Start a new thinking block if needed
       if (this.currentContentBlockType !== 'thinking') {
         // Close previous block if any
@@ -458,19 +548,22 @@ export class ClaudeStreamConverter {
           content_block: { type: 'thinking', thinking: '' },
         }))
       }
-      // Send thinking delta
-      events.push(this.formatEvent({
-        type: 'content_block_delta',
-        index: this.currentContentBlockIndex,
-        delta: { type: 'thinking_delta', thinking: delta.reasoning_content },
-      }))
-      // Accumulate thinking content for signature generation
-      this.thinkingAccumulator += delta.reasoning_content
+      // Send thinking delta (only if non-empty)
+      if (delta.reasoning_content) {
+        events.push(this.formatEvent({
+          type: 'content_block_delta',
+          index: this.currentContentBlockIndex,
+          delta: { type: 'thinking_delta', thinking: delta.reasoning_content },
+        }))
+        // Accumulate thinking content for signature generation
+        this.thinkingAccumulator += delta.reasoning_content
+      }
       this.totalOutputTokens++
     }
 
-    // Handle text content
-    if (delta?.content) {
+    // Handle text content - KEY FIX: use != null to allow empty strings through
+    // DeepSeek sometimes sends delta.content = "" which should be treated as valid
+    if (delta?.content != null) {
       // Start a new text block if needed
       if (this.currentContentBlockType !== 'text') {
         // Close previous block if any
@@ -497,12 +590,14 @@ export class ClaudeStreamConverter {
           content_block: { type: 'text', text: '' },
         }))
       }
-      // Send text delta
-      events.push(this.formatEvent({
-        type: 'content_block_delta',
-        index: this.currentContentBlockIndex,
-        delta: { type: 'text_delta', text: delta.content },
-      }))
+      // Send text delta (only if non-empty to avoid empty deltas)
+      if (delta.content !== '') {
+        events.push(this.formatEvent({
+          type: 'content_block_delta',
+          index: this.currentContentBlockIndex,
+          delta: { type: 'text_delta', text: delta.content },
+        }))
+      }
       this.totalOutputTokens++
     }
 
@@ -532,28 +627,30 @@ export class ClaudeStreamConverter {
 
           this.toolCallBuffers.set(tcIndex, {
             id: tc.id || `toolu_${Date.now().toString(36)}`,
-            name: tc.function?.name || '',
+            name: '',
             arguments: '',
           })
 
-          // Start new tool_use block
           this.currentContentBlockIndex++
           this.currentContentBlockType = 'tool_use'
+
+          const buffer = this.toolCallBuffers.get(tcIndex)!
 
           events.push(this.formatEvent({
             type: 'content_block_start',
             index: this.currentContentBlockIndex,
             content_block: {
               type: 'tool_use',
-              id: this.toolCallBuffers.get(tcIndex)!.id,
+              id: buffer.id,
               name: tc.function?.name || '',
               input: {},
             },
           }))
         }
 
-        // Append arguments
         const buffer = this.toolCallBuffers.get(tcIndex)!
+
+        // Update buffer with function name and arguments
         if (tc.function?.name) {
           buffer.name = tc.function.name
         }
@@ -609,6 +706,8 @@ export class ClaudeStreamConverter {
       events.push(this.formatEvent({
         type: 'message_stop',
       }))
+
+      this.finalized = true
     }
 
     return events
@@ -618,6 +717,11 @@ export class ClaudeStreamConverter {
    * Generate the final events when stream ends without a finish_reason
    */
   finalize(): string[] {
+    if (this.finalized) {
+      return []
+    }
+    this.finalized = true
+
     const events: string[] = []
 
     if (!this.messageStarted) {
@@ -675,11 +779,13 @@ export class ClaudeStreamConverter {
 
   /**
    * Format a Claude stream event as SSE data
+   * Each event MUST end with \n\n for proper SSE parsing
    */
   private formatEvent(event: ClaudeStreamEvent): string {
     return `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`
   }
 }
+
 
 // ============================================================
 // Utility Functions
