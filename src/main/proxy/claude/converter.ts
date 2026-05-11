@@ -711,9 +711,11 @@ export class ClaudeStreamConverter {
 
     // Close text block if still open
     if (this.textBlockStarted && !this.textBlockClosed) {
+      // Determine the correct index for the text block
+      const textCloseIndex = this.thinkingBlockStarted ? 2 : 0
       output += this.formatEvent({
         type: 'content_block_stop',
-        index: 0,
+        index: textCloseIndex,
       })
       this.textBlockClosed = true
     }
