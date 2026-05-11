@@ -419,6 +419,9 @@ router.post('/messages', async (ctx: Context) => {
             for (const event of finalEvents) {
               wrapperStream.write(event)
             }
+
+            // Send data: [DONE] after message_stop (Claude Code expects this)
+            wrapperStream.write('data: [DONE]\n\n')
           } else {
             // Stream needs transformation through streamHandler first
             const transformStream = streamHandler.createTransformStream(
@@ -456,10 +459,11 @@ router.post('/messages', async (ctx: Context) => {
             for (const event of finalEvents) {
               wrapperStream.write(event)
             }
+
+            // Send data: [DONE] after message_stop (Claude Code expects this)
+            wrapperStream.write('data: [DONE]\n\n')
           }
 
-          // Send ping
-          wrapperStream.write(`event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`)
           wrapperStream.end()
 
           // Update log

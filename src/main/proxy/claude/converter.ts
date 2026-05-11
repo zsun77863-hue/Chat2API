@@ -378,17 +378,32 @@ function createEmptyClaudeResponse(id: string, model: string): ClaudeMessageResp
  * - Correct [DONE] handling with finalize
  * - Proper stream end with message_stop
  */
+/**
+ * State tracker for converting OpenAI SSE stream to Claude SSE stream
+ *
+ * v1.8.2: Complete rewrite based on reference claude-code-proxy implementation
+ * - message_start sent IMMEDIATELY before any content
+ * - content_block_start for text sent IMMEDIATELY after message_start
+ * - ping event sent after content_block_start
+ * - Text deltas only for non-empty content
+ * - Proper [DONE] handling with data: [DONE] after message_stop
+ * - SSE line buffering for chunk boundaries
+ * - cache_creation_input_tokens and cache_read_input_tokens in usage
+ */
 export class ClaudeStreamConverter {
   private requestId: string
   private model: string
   private messageStarted = false
-  private currentContentBlockIndex = -1
-  private currentContentBlockType: string | null = null
+  private textBlockStarted = false
+  private textBlockClosed = false
+  private messageStopped = false
   private toolCallBuffers: Map<number, { id: string; name: string; arguments: string }> = new Map()
+  private currentToolBlockIndex = -1
   private totalOutputTokens = 0
   private inputTokens = 0
   private thinkingAccumulator = ''
-  private finalized = false
+  private thinkingBlockStarted = false
+  private thinkingBlockClosed = false
   // SSE line buffer for handling chunk boundaries
   private lineBuffer = ''
 
@@ -415,14 +430,7 @@ export class ClaudeStreamConverter {
       const raw = trimmed.slice(5).trim()
 
       if (raw === '[DONE]') {
-        // If header hasn't been sent yet (extreme edge case), send it
-        if (!this.messageStarted) {
-          output += this.sendMessageStart()
-        }
-        const finalEvents = this.finalize()
-        for (const event of finalEvents) {
-          output += event
-        }
+        output += this.handleDone()
         continue
       }
 
@@ -433,10 +441,7 @@ export class ClaudeStreamConverter {
         continue
       }
 
-      const claudeEvents = this.convertChunk(parsed)
-      for (const event of claudeEvents) {
-        output += event
-      }
+      output += this.convertChunk(parsed)
     }
 
     return output
@@ -454,10 +459,7 @@ export class ClaudeStreamConverter {
         if (raw !== '[DONE]') {
           try {
             const parsed = JSON.parse(raw)
-            const claudeEvents = this.convertChunk(parsed)
-            for (const event of claudeEvents) {
-              output += event
-            }
+            output += this.convertChunk(parsed)
           } catch {
             // Skip unparseable
           }
@@ -469,135 +471,141 @@ export class ClaudeStreamConverter {
   }
 
   /**
-   * Send the message_start event
+   * Send the initial message_start + content_block_start + ping events
+   * This MUST be called before any content is sent
    */
-  private sendMessageStart(): string {
+  private ensureMessageStarted(): string {
+    if (this.messageStarted) return ''
     this.messageStarted = true
-    return this.formatEvent({
+
+    let output = ''
+
+    // 1. message_start event
+    output += this.formatEvent({
       type: 'message_start',
       message: {
         id: this.requestId,
         type: 'message',
         role: 'assistant',
-        content: [],
         model: this.model,
+        content: [],
         stop_reason: null,
         stop_sequence: null,
         usage: {
           input_tokens: this.inputTokens,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
           output_tokens: 0,
         },
       },
     })
+
+    // 2. content_block_start for text (index 0) - ALWAYS start with text block
+    output += this.formatEvent({
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'text', text: '' },
+    })
+    this.textBlockStarted = true
+
+    // 3. ping event
+    output += this.formatEvent({
+      type: 'ping',
+    })
+
+    return output
   }
 
   /**
-   * Convert an OpenAI stream chunk to one or more Claude stream events
+   * Convert an OpenAI stream chunk to Claude SSE events string
    */
-  convertChunk(chunk: any): string[] {
-    const events: string[] = []
+  private convertChunk(chunk: any): string {
+    let output = ''
 
     if (!chunk || !chunk.choices || chunk.choices.length === 0) {
-      return events
+      return output
     }
 
     const choice = chunk.choices[0]
     const delta = choice.delta
 
-    // Start message on first chunk with valid data
-    if (!this.messageStarted) {
-      // Extract usage from the chunk if available
-      if (chunk.usage) {
-        this.inputTokens = chunk.usage.prompt_tokens || 0
-      }
-      events.push(this.sendMessageStart())
+    // Extract usage from the chunk if available
+    if (chunk.usage) {
+      this.inputTokens = chunk.usage.prompt_tokens || 0
     }
 
-    // Handle role delta (first chunk usually) - still need to ensure message_start is sent
-    if (delta?.role === 'assistant' && delta.content == null && !delta.tool_calls && !delta.reasoning_content) {
-      // Just the role announcement, no content yet
-      // But we've already sent message_start, so this is fine
-      return events
-    }
+    // Ensure message_start has been sent
+    output += this.ensureMessageStarted()
 
     // Handle reasoning_content (thinking) - convert to Claude thinking blocks
-    if (delta?.reasoning_content != null) {
-      // Start a new thinking block if needed
-      if (this.currentContentBlockType !== 'thinking') {
-        // Close previous block if any
-        if (this.currentContentBlockIndex >= 0) {
-          // If closing a thinking block, emit signature_delta first
-          if (this.currentContentBlockType === 'thinking' && this.thinkingAccumulator) {
-            const signature = generateThinkingSignature(this.thinkingAccumulator)
-            events.push(this.formatEvent({
-              type: 'content_block_delta',
-              index: this.currentContentBlockIndex,
-              delta: { type: 'signature_delta', signature },
-            }))
-          }
-          events.push(this.formatEvent({
-            type: 'content_block_stop',
-            index: this.currentContentBlockIndex,
-          }))
-        }
-        this.currentContentBlockIndex++
-        this.currentContentBlockType = 'thinking'
-        events.push(this.formatEvent({
+    if (delta?.reasoning_content != null && delta.reasoning_content !== '') {
+      // Close text block first if it was started and not yet closed
+      if (this.textBlockStarted && !this.textBlockClosed) {
+        output += this.formatEvent({
+          type: 'content_block_stop',
+          index: 0,
+        })
+        this.textBlockClosed = true
+      }
+
+      // Start thinking block if not started
+      if (!this.thinkingBlockStarted) {
+        this.thinkingBlockStarted = true
+        output += this.formatEvent({
           type: 'content_block_start',
-          index: this.currentContentBlockIndex,
+          index: 1,
           content_block: { type: 'thinking', thinking: '' },
-        }))
+        })
       }
-      // Send thinking delta (only if non-empty)
-      if (delta.reasoning_content) {
-        events.push(this.formatEvent({
-          type: 'content_block_delta',
-          index: this.currentContentBlockIndex,
-          delta: { type: 'thinking_delta', thinking: delta.reasoning_content },
-        }))
-        // Accumulate thinking content for signature generation
-        this.thinkingAccumulator += delta.reasoning_content
-      }
+
+      // Send thinking delta
+      output += this.formatEvent({
+        type: 'content_block_delta',
+        index: 1,
+        delta: { type: 'thinking_delta', thinking: delta.reasoning_content },
+      })
+      this.thinkingAccumulator += delta.reasoning_content
       this.totalOutputTokens++
     }
 
-    // Handle text content - KEY FIX: use != null to allow empty strings through
-    // DeepSeek sometimes sends delta.content = "" which should be treated as valid
-    if (delta?.content != null) {
-      // Start a new text block if needed
-      if (this.currentContentBlockType !== 'text') {
-        // Close previous block if any
-        if (this.currentContentBlockIndex >= 0) {
-          // If closing a thinking block, emit signature_delta first
-          if (this.currentContentBlockType === 'thinking' && this.thinkingAccumulator) {
-            const signature = generateThinkingSignature(this.thinkingAccumulator)
-            events.push(this.formatEvent({
-              type: 'content_block_delta',
-              index: this.currentContentBlockIndex,
-              delta: { type: 'signature_delta', signature },
-            }))
-          }
-          events.push(this.formatEvent({
-            type: 'content_block_stop',
-            index: this.currentContentBlockIndex,
-          }))
+    // Handle text content - only send non-empty content
+    if (delta?.content != null && delta.content !== '') {
+      // If we were in a thinking block, close it and reopen text block
+      if (this.thinkingBlockStarted && !this.thinkingBlockClosed) {
+        // Send signature_delta before closing thinking block
+        if (this.thinkingAccumulator) {
+          const signature = generateThinkingSignature(this.thinkingAccumulator)
+          output += this.formatEvent({
+            type: 'content_block_delta',
+            index: 1,
+            delta: { type: 'signature_delta', signature },
+          })
         }
-        this.currentContentBlockIndex++
-        this.currentContentBlockType = 'text'
-        events.push(this.formatEvent({
+        output += this.formatEvent({
+          type: 'content_block_stop',
+          index: 1,
+        })
+        this.thinkingBlockClosed = true
+      }
+
+      // If text block was closed (because thinking started), reopen it
+      if (this.textBlockClosed) {
+        const textIndex = this.thinkingBlockStarted ? 2 : 0
+        output += this.formatEvent({
           type: 'content_block_start',
-          index: this.currentContentBlockIndex,
+          index: textIndex,
           content_block: { type: 'text', text: '' },
-        }))
+        })
+        this.textBlockClosed = false
       }
-      // Send text delta (only if non-empty to avoid empty deltas)
-      if (delta.content !== '') {
-        events.push(this.formatEvent({
-          type: 'content_block_delta',
-          index: this.currentContentBlockIndex,
-          delta: { type: 'text_delta', text: delta.content },
-        }))
-      }
+
+      // Send text delta
+      const textIndex = this.thinkingBlockStarted && !this.thinkingBlockClosed ? 2 : 0
+      output += this.formatEvent({
+        type: 'content_block_delta',
+        index: textIndex,
+        delta: { type: 'text_delta', text: delta.content },
+      })
       this.totalOutputTokens++
     }
 
@@ -608,21 +616,30 @@ export class ClaudeStreamConverter {
 
         // Initialize tool call buffer if new
         if (!this.toolCallBuffers.has(tcIndex)) {
-          // Close previous content block if any
-          if (this.currentContentBlockIndex >= 0 && this.currentContentBlockType !== 'tool_use') {
-            // If closing a thinking block, emit signature_delta first
-            if (this.currentContentBlockType === 'thinking' && this.thinkingAccumulator) {
-              const signature = generateThinkingSignature(this.thinkingAccumulator)
-              events.push(this.formatEvent({
-                type: 'content_block_delta',
-                index: this.currentContentBlockIndex,
-                delta: { type: 'signature_delta', signature },
-              }))
-            }
-            events.push(this.formatEvent({
+          // Close text block if still open
+          if (this.textBlockStarted && !this.textBlockClosed) {
+            output += this.formatEvent({
               type: 'content_block_stop',
-              index: this.currentContentBlockIndex,
-            }))
+              index: 0,
+            })
+            this.textBlockClosed = true
+          }
+
+          // Close thinking block if still open
+          if (this.thinkingBlockStarted && !this.thinkingBlockClosed) {
+            if (this.thinkingAccumulator) {
+              const signature = generateThinkingSignature(this.thinkingAccumulator)
+              output += this.formatEvent({
+                type: 'content_block_delta',
+                index: 1,
+                delta: { type: 'signature_delta', signature },
+              })
+            }
+            output += this.formatEvent({
+              type: 'content_block_stop',
+              index: 1,
+            })
+            this.thinkingBlockClosed = true
           }
 
           this.toolCallBuffers.set(tcIndex, {
@@ -631,71 +648,226 @@ export class ClaudeStreamConverter {
             arguments: '',
           })
 
-          this.currentContentBlockIndex++
-          this.currentContentBlockType = 'tool_use'
+          this.currentToolBlockIndex++
+          const blockIndex = this.getNextBlockIndex()
 
-          const buffer = this.toolCallBuffers.get(tcIndex)!
-
-          events.push(this.formatEvent({
+          output += this.formatEvent({
             type: 'content_block_start',
-            index: this.currentContentBlockIndex,
+            index: blockIndex,
             content_block: {
               type: 'tool_use',
-              id: buffer.id,
+              id: this.toolCallBuffers.get(tcIndex)!.id,
               name: tc.function?.name || '',
               input: {},
             },
-          }))
+          })
         }
 
         const buffer = this.toolCallBuffers.get(tcIndex)!
 
-        // Update buffer with function name and arguments
         if (tc.function?.name) {
           buffer.name = tc.function.name
         }
         if (tc.function?.arguments) {
           buffer.arguments += tc.function.arguments
-          // Send input_json_delta
-          events.push(this.formatEvent({
+          const blockIndex = this.getNextBlockIndex()
+          output += this.formatEvent({
             type: 'content_block_delta',
-            index: this.currentContentBlockIndex,
+            index: blockIndex,
             delta: {
               type: 'input_json_delta',
               partial_json: tc.function.arguments,
             },
-          }))
+          })
         }
       }
     }
 
-    // Handle finish
+    // Handle finish_reason
     if (choice.finish_reason) {
-      // Close current content block
-      if (this.currentContentBlockIndex >= 0) {
-        // If closing a thinking block, emit signature_delta first
-        if (this.currentContentBlockType === 'thinking' && this.thinkingAccumulator) {
+      output += this.handleFinish(choice.finish_reason)
+    }
+
+    return output
+  }
+
+  /**
+   * Get the next content block index based on current state
+   */
+  private getNextBlockIndex(): number {
+    let index = 0
+    if (this.textBlockStarted) index++
+    if (this.thinkingBlockStarted) index++
+    index += this.currentToolBlockIndex
+    return index
+  }
+
+  /**
+   * Handle finish_reason - close all open blocks and send message_stop
+   */
+  private handleFinish(finishReason: string): string {
+    if (this.messageStopped) return ''
+    let output = ''
+
+    // Close text block if still open
+    if (this.textBlockStarted && !this.textBlockClosed) {
+      output += this.formatEvent({
+        type: 'content_block_stop',
+        index: 0,
+      })
+      this.textBlockClosed = true
+    }
+
+    // Close thinking block if still open
+    if (this.thinkingBlockStarted && !this.thinkingBlockClosed) {
+      if (this.thinkingAccumulator) {
+        const signature = generateThinkingSignature(this.thinkingAccumulator)
+        output += this.formatEvent({
+          type: 'content_block_delta',
+          index: 1,
+          delta: { type: 'signature_delta', signature },
+        })
+      }
+      output += this.formatEvent({
+        type: 'content_block_stop',
+        index: 1,
+      })
+      this.thinkingBlockClosed = true
+    }
+
+    // Close any open tool blocks
+    for (let i = 0; i < this.toolCallBuffers.size; i++) {
+      const blockIndex = this.getNextBlockIndex() - this.toolCallBuffers.size + i
+      output += this.formatEvent({
+        type: 'content_block_stop',
+        index: blockIndex,
+      })
+    }
+
+    // Map finish reason
+    const stopReason = mapFinishReasonToStopReason(finishReason)
+
+    // Send message_delta
+    output += this.formatEvent({
+      type: 'message_delta',
+      delta: {
+        stop_reason: stopReason,
+        stop_sequence: null,
+      },
+      usage: {
+        output_tokens: this.totalOutputTokens,
+      },
+    })
+
+    // Send message_stop
+    output += this.formatEvent({
+      type: 'message_stop',
+    })
+
+    this.messageStopped = true
+    return output
+  }
+
+  /**
+   * Handle [DONE] marker - finalize the stream
+   */
+  private handleDone(): string {
+    let output = ''
+
+    // Ensure message has started
+    output += this.ensureMessageStarted()
+
+    // If not already stopped, finalize
+    if (!this.messageStopped) {
+      // Close any open blocks
+      if (this.textBlockStarted && !this.textBlockClosed) {
+        output += this.formatEvent({
+          type: 'content_block_stop',
+          index: 0,
+        })
+        this.textBlockClosed = true
+      }
+
+      if (this.thinkingBlockStarted && !this.thinkingBlockClosed) {
+        if (this.thinkingAccumulator) {
+          const signature = generateThinkingSignature(this.thinkingAccumulator)
+          output += this.formatEvent({
+            type: 'content_block_delta',
+            index: 1,
+            delta: { type: 'signature_delta', signature },
+          })
+        }
+        output += this.formatEvent({
+          type: 'content_block_stop',
+          index: 1,
+        })
+        this.thinkingBlockClosed = true
+      }
+
+      // Send message_delta and message_stop
+      output += this.formatEvent({
+        type: 'message_delta',
+        delta: {
+          stop_reason: 'end_turn',
+          stop_sequence: null,
+        },
+        usage: {
+          output_tokens: this.totalOutputTokens,
+        },
+      })
+
+      output += this.formatEvent({
+        type: 'message_stop',
+      })
+
+      this.messageStopped = true
+    }
+
+    return output
+  }
+
+  /**
+   * Finalize the stream (called when stream ends)
+   */
+  finalize(): string[] {
+    const events: string[] = []
+
+    // Ensure message has started
+    const startOutput = this.ensureMessageStarted()
+    if (startOutput) {
+      events.push(startOutput)
+    }
+
+    if (!this.messageStopped) {
+      // Close any open blocks
+      if (this.textBlockStarted && !this.textBlockClosed) {
+        events.push(this.formatEvent({
+          type: 'content_block_stop',
+          index: 0,
+        }))
+        this.textBlockClosed = true
+      }
+
+      if (this.thinkingBlockStarted && !this.thinkingBlockClosed) {
+        if (this.thinkingAccumulator) {
           const signature = generateThinkingSignature(this.thinkingAccumulator)
           events.push(this.formatEvent({
             type: 'content_block_delta',
-            index: this.currentContentBlockIndex,
+            index: 1,
             delta: { type: 'signature_delta', signature },
           }))
         }
         events.push(this.formatEvent({
           type: 'content_block_stop',
-          index: this.currentContentBlockIndex,
+          index: 1,
         }))
+        this.thinkingBlockClosed = true
       }
 
-      // Map finish reason
-      const stopReason = mapFinishReasonToStopReason(choice.finish_reason)
-
-      // Send message delta and stop
       events.push(this.formatEvent({
         type: 'message_delta',
         delta: {
-          stop_reason: stopReason,
+          stop_reason: 'end_turn',
           stop_sequence: null,
         },
         usage: {
@@ -707,72 +879,8 @@ export class ClaudeStreamConverter {
         type: 'message_stop',
       }))
 
-      this.finalized = true
+      this.messageStopped = true
     }
-
-    return events
-  }
-
-  /**
-   * Generate the final events when stream ends without a finish_reason
-   */
-  finalize(): string[] {
-    if (this.finalized) {
-      return []
-    }
-    this.finalized = true
-
-    const events: string[] = []
-
-    if (!this.messageStarted) {
-      // No chunks were received, send empty response
-      events.push(this.formatEvent({
-        type: 'message_start',
-        message: {
-          id: this.requestId,
-          type: 'message',
-          role: 'assistant',
-          content: [],
-          model: this.model,
-          stop_reason: null,
-          stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 },
-        },
-      }))
-    }
-
-    // Close current content block if still open
-    if (this.currentContentBlockIndex >= 0 && this.currentContentBlockType !== null) {
-      // If closing a thinking block, emit signature_delta first
-      if (this.currentContentBlockType === 'thinking' && this.thinkingAccumulator) {
-        const signature = generateThinkingSignature(this.thinkingAccumulator)
-        events.push(this.formatEvent({
-          type: 'content_block_delta',
-          index: this.currentContentBlockIndex,
-          delta: { type: 'signature_delta', signature },
-        }))
-      }
-      events.push(this.formatEvent({
-        type: 'content_block_stop',
-        index: this.currentContentBlockIndex,
-      }))
-    }
-
-    // Send final message delta and stop
-    events.push(this.formatEvent({
-      type: 'message_delta',
-      delta: {
-        stop_reason: 'end_turn',
-        stop_sequence: null,
-      },
-      usage: {
-        output_tokens: this.totalOutputTokens,
-      },
-    }))
-
-    events.push(this.formatEvent({
-      type: 'message_stop',
-    }))
 
     return events
   }
@@ -785,6 +893,7 @@ export class ClaudeStreamConverter {
     return `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`
   }
 }
+
 
 
 // ============================================================
